@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="FX・CFDの損切り価格、必要証拠金、許容損失額からロット数を計算します。">
+<title>損切りライン計算ツール</title>
+<script id="calculations">
+'use strict';
+
+const instruments = [
+  { id: 'XAUUSD', name: 'XAUUSD（GOLD）', contractSize: 100, priceDecimals: 2, minLot: 0.01, lotStep: 0.01 },
+  { id: 'BTCUSD', name: 'BTCUSD', contractSize: 1, priceDecimals: 2, minLot: 0.01, lotStep: 0.01 },
+];
+
+const providers = [
+  { instrument: 'BTCUSD', name: 'Binance（BTCUSDT）', url: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT',
+    parse: data => data?.symbol === 'BTCUSDT' ? positive(data.price) : null },
+  { instrument: 'XAUUSD', name: 'xaus.com', url: 'https://xaus.com/api/v1/spot', parse: parseGold },
+  // 予備を使う場合は name、url、parse（JSON → USD価格またはnull）を設定。
+  { instrument: 'XAUUSD', name: '予備', url: '', parse: null },
+];
+
+function positive(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function parseGold(data) {
+  if (!data || typeof data !== 'object') return null;
+  const normalize = key => key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const ozKeys = ['spotusdoz', 'xauusdoz', 'goldusdoz', 'usdpertroyounce'];
+  const goldKeys = ['xauusd', 'xau', 'gold'];
+  const wrappers = ['data', 'result', 'results', 'rates', 'prices', 'quote', 'quotes', 'spot'];
+  function search(node, isGold = false, depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 7) return null;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const found = search(item, isGold, depth + 1);
+        if (found !== null) return found;
+      }
+      return null;
+    }
+    const fields = Object.fromEntries(Object.entries(node).map(([key, value]) => [normalize(key), value]));
+    for (const key of ozKeys) {
+      const found = positive(fields[key]);
+      if (found !== null) return found;
+    }
+    const symbol = fields.symbol ?? fields.metal ?? fields.instrument;
+    const identified = typeof symbol === 'string' && goldKeys.includes(normalize(symbol));
+    const usd = fields.currency ?? fields.quotecurrency ?? fields.quote;
+    const unit = fields.unit;
+    const validQuote = typeof usd !== 'string' || normalize(usd) === 'usd';
+    const validUnit = unit == null || ['oz', 'ounce', 'troyoz', 'troyounce', 'toz', 'ozt'].includes(normalize(String(unit)));
+    if ((isGold || identified) && validQuote && validUnit) {
+      for (const key of ['price', 'spotprice', 'spot', 'last', 'usd', 'value']) {
+        const found = positive(fields[key]);
+        if (found !== null) return found;
+      }
+    }
+    for (const key of goldKeys) {
+      const found = (key === 'xauusd' ? positive(fields[key]) : null) ?? search(fields[key], true, depth + 1);
+      if (found !== null) return found;
+    }
+    for (const key of wrappers) {
+      const found = search(fields[key], (isGold || identified) && validQuote && validUnit, depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  return search(data);
+}
+
+function lossAmount(distance, lot, size) {
+  return distance * lot * size;
+}
+
+function stopPrice(price, loss, lot, size, side) {
+  return price + (side === 'buy' ? -1 : 1) * loss / (lot * size);
+}
+
+function theoreticalLot(loss, distance, size) {
+  return loss / (distance * size);
+}
+
+function practicalLot(lot, minLot, lotStep) {
+  const steps = lot / lotStep;
+  if (!Number.isFinite(steps)) return NaN;
+  const nearest = Math.round(steps);
+  const count = Math.abs(steps - nearest) <= Number.EPSILON * Math.max(1, Math.abs(steps)) * 2
+    ? nearest : Math.floor(steps);
+  const result = Number((count * lotStep).toPrecision(15));
+  return result >= minLot ? result : 0;
+}
+
+function margin(price, lot, size, leverage) {
+  return price * lot * size / leverage;
+}
+
+// 有効証拠金 = 残高 − 含み損。必要証拠金は現在価格で計算した額に固定。
+function liquidation(price, balanceUSD, lot, size, leverage, threshold, side) {
+  const lossUSD = balanceUSD - margin(price, lot, size, leverage) * threshold;
+  return lossUSD > 0 ? stopPrice(price, lossUSD, lot, size, side) : price;
+}
+</script>
+<style>
+:root{color-scheme:dark;--bg:#0c111a;--panel:#151d2b;--field:#0e1520;--line:#344158;--text:#f1f5ff;--muted:#acb9cd;--accent:#83e5c7;--warn:#ffb5a3;--mono:ui-monospace,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:1rem/1.55 system-ui,sans-serif}
+main{width:min(1160px,100%);margin:auto;padding:clamp(1rem,4vw,2.75rem)}
+header{margin-bottom:1.4rem}
+header p{margin:.25rem 0;color:var(--accent);font:700 .85rem var(--mono);letter-spacing:.08em}
+h1{margin:0;font-size:clamp(1.6rem,4.6vw,2.45rem);line-height:1.25}
+h2{font-size:1.15rem;margin:0 0 .85rem}
+h3{font-size:1rem;margin:1rem 0 .55rem}
+.layout,.stack{display:grid;gap:1rem;align-items:start;min-width:0}
+.card{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:1rem;padding:clamp(.85rem,3vw,1.35rem)}
+.grid,.metrics,.controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem}
+.controls{align-items:center}
+label{display:block;min-width:0;font-size:.9rem}
+input,select,button{font:inherit}
+input[type=number],select,button{width:100%;min-height:2.75rem;background:var(--field);color:var(--text);border:1px solid var(--line);border-radius:.55rem;padding:.4rem .65rem}
+label>input[type=number],label>select{display:block;margin-top:.22rem}
+input[type=number],.number,td,output{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+input[type=checkbox]{accent-color:var(--accent);width:1.05rem;height:1.05rem;margin:0 .3rem 0 0;vertical-align:middle}
+button{cursor:pointer}
+button:hover{border-color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.primary{background:var(--accent);color:#06271e;border-color:var(--accent);font-weight:750}
+.price{margin-top:1rem;border-top:1px solid var(--line);padding-top:.85rem}
+.price .controls{margin-top:.65rem}
+.badge{display:inline-block;border-radius:1rem;padding:.1rem .55rem;margin-left:.4rem;color:var(--accent);background:#203b3c;font-size:.78rem}
+.note,.meta,caption{color:var(--muted);font-size:.83rem;margin:.55rem 0}
+.meta{display:flex;flex-wrap:wrap;gap:.15rem 1rem}
+.error{color:var(--warn);margin:.4rem 0;font-size:.88rem}
+.metrics>div{min-width:0;padding:.55rem .65rem;background:var(--field);border-radius:.55rem}
+.metrics dt{font-size:.8rem;color:var(--muted)}
+.metrics dd{margin:.2rem 0 0;color:var(--accent);overflow-wrap:anywhere}
+.pills{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.55rem}
+.pills label{border:1px solid var(--line);border-radius:.55rem;padding:.42rem .55rem;background:var(--field)}
+.table{overflow:auto;margin-top:.65rem}
+table{border-collapse:collapse;width:100%;font-size:.85rem}
+th,td{text-align:right;padding:.48rem .36rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-size:.8rem}
+th:first-child{text-align:left}
+tbody th{font-weight:500}
+td button{width:auto;min-height:2rem;padding:.2rem .4rem;color:var(--accent)}
+tr[data-copy]{cursor:pointer}
+tr[data-copy]:hover{background:#202d3f}
+caption{text-align:left}
+footer{position:fixed;bottom:0;inset-inline:0;padding:.6rem 1rem calc(.6rem + env(safe-area-inset-bottom));background:#111a28;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem;z-index:2}
+footer div{max-width:1100px;margin:auto}
+.toast{position:fixed;bottom:calc(var(--footer, 95px) + .65rem);right:1rem;border:1px solid var(--line);background:#203b3c;color:var(--text);border-radius:.5rem;padding:.4rem .75rem;z-index:3}
+[hidden]{display:none!important}
+@media(min-width:850px){.layout{grid-template-columns:minmax(295px, .78fr) minmax(0,1.3fr)}}
+</style>
+</head>
+<body>
+<main>
+  <header><p>FX / CFD</p><h1>損切りライン計算ツール</h1></header>
+  <div class="layout">
+    <div class="stack">
+      <section class="card" aria-labelledby="position-title">
+        <h2 id="position-title">ポジション設定</h2>
+        <div class="grid">
+          <label>銘柄<select id="symbol"></select></label>
+          <label>売買方向<select id="side"><option value="buy">買い</option><option value="sell">売り</option></select></label>
+          <label>ロット数<input id="lot" type="number" inputmode="decimal" step="any" value="0.10"></label>
+          <label>契約サイズ<input id="size" type="number" inputmode="decimal" step="any" aria-describedby="contract-note"></label>
+        </div>
+        <p class="note" id="contract-note">契約サイズはご利用の口座仕様で確認してください。</p>
+        <div class="grid">
+          <label>レバレッジ<select id="leverage"><option>25</option><option selected>100</option><option>200</option><option>500</option><option value="custom">手入力</option></select></label>
+          <label id="customLevField" hidden>レバレッジ（倍率）<input id="customLev" type="number" inputmode="decimal" step="any"></label>
+          <label>口座通貨<select id="currency"><option>JPY</option><option>USD</option></select></label>
+          <label>口座残高<input id="balance" type="number" inputmode="decimal" step="any"></label>
+          <label id="rateField">USDJPY（1 USDあたり）<input id="rate" type="number" inputmode="decimal" step="any"></label>
+        </div>
+        <div class="price">
+          <label>現在価格（USD） <span class="badge" id="manualBadge" hidden>手入力中</span><input id="price" type="number" inputmode="decimal" step="any" placeholder="取得または手入力"></label>
+          <div class="controls">
+            <button class="primary" id="refresh" type="button">価格更新</button>
+            <label><input id="auto" type="checkbox">自動更新（30秒）</label>
+            <button id="resume" type="button" hidden>自動取得に戻す</button>
+          </div>
+          <p class="meta"><span>取得元 <strong id="source">—</strong></span><span>取得時刻 <time id="fetched">—</time></span></p>
+          <p class="note">参考価格です。ご利用のブローカーの価格と差がある場合があります。</p>
+          <p class="error" id="priceStatus" role="status" hidden></p>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="margin-title">
+        <h2 id="margin-title">証拠金</h2>
+        <dl class="metrics"><div><dt>必要証拠金</dt><dd class="number" id="required"></dd></div><div><dt>余剰証拠金</dt><dd class="number" id="free"></dd></div></dl>
+        <h3>簡易ロスカット試算</h3>
+        <div class="grid">
+          <label>証拠金維持率（%）<input id="threshold" type="number" inputmode="decimal" step="any" value="20"></label>
+          <dl class="metrics" style="grid-template-columns:1fr;margin:0"><div><dt>ロスカット価格（USD）</dt><dd class="number" id="cut"></dd></div></dl>
+        </div>
+        <p class="note">ブローカーにより計算式が異なる概算です。必要証拠金を現在価格で固定し、このポジションの含み損だけを反映します。</p>
+      </section>
+    </div>
+    <div class="stack">
+      <section class="card" aria-labelledby="stops-title">
+        <h2 id="stops-title">損失額から損切り価格を計算</h2>
+        <div id="presets" class="pills" role="group" aria-label="損失額のプリセット"></div>
+        <div class="controls">
+          <label>任意の損失額（<span data-currency></span>）<input id="customLoss" type="number" inputmode="decimal" step="any"></label>
+          <button id="addLoss" type="button">金額を追加</button>
+        </div>
+        <div id="extras" class="pills"></div>
+        <div class="table">
+          <table>
+            <caption>価格のある行をタップするとコピーできます。</caption>
+            <thead><tr><th scope="col">損失額（<span data-currency></span>）</th><th scope="col">損切り価格</th><th scope="col">値幅</th><th scope="col">変動率</th></tr></thead>
+            <tbody id="stops"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="lots-title">
+        <h2 id="lots-title">損切り幅からロット数を逆算</h2>
+        <div class="grid">
+          <label>許容損失額（<span data-currency></span>）<input id="budget" type="number" inputmode="decimal" step="any"></label>
+          <label>入力方法<select id="distanceType"><option value="distance">価格差</option><option value="stop">損切り価格</option></select></label>
+          <label id="distanceField">価格差（USD）<input id="distance" type="number" inputmode="decimal" step="any"></label>
+          <label id="stopField" hidden>損切り価格（USD）<input id="stopInput" type="number" inputmode="decimal" step="any"></label>
+        </div>
+        <p class="note" id="lotSpec"></p>
+        <p class="error" id="lotStatus" role="status" hidden></p>
+        <dl class="metrics">
+          <div><dt>理論ロット数</dt><dd class="number" id="ideal"></dd></div>
+          <div><dt>実用ロット数</dt><dd class="number" id="usable"></dd></div>
+          <div><dt>実際の損失額</dt><dd class="number" id="actual"></dd></div>
+          <div><dt>必要証拠金</dt><dd class="number" id="reverseMargin"></dd></div>
+        </dl>
+        <div class="table"><table>
+          <caption>実用ロットの前後3候補（0.01刻み）</caption>
+          <thead><tr><th scope="col">ロット数</th><th scope="col">損失額（<span data-currency></span>）</th></tr></thead>
+          <tbody id="nearby"></tbody>
+        </table></div>
+      </section>
+    </div>
+  </div>
+</main>
+<footer><div>本ツールは計算補助であり、売買の推奨・投資助言ではありません。契約サイズ・証拠金・ロスカット条件はご利用のブローカーの仕様を必ず確認してください。</div></footer>
+<div class="toast" id="toast" role="status" hidden></div>
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const amounts = [1000, 3000, 5000, 10000, 30000, 50000, 100000];
+const fields = ['symbol', 'side', 'lot', 'leverage', 'customLev', 'currency', 'balance', 'rate',
+  'threshold', 'customLoss', 'budget', 'distanceType', 'distance', 'stopInput'];
+const storageKey = 'stop-loss-calculator-v1';
+let selected = [1000, 3000, 5000];
+let extras = [];
+let overrides = {};
+let manualPrices = {};
+let quote = null;
+let generation = 0;
+let interval;
+let toastTimer;
+const instrument = () => instruments.find(item => item.id === $('symbol').value);
+const hasManual = () => Object.hasOwn(manualPrices, instrument().id);
+const value = id => positive($(id).value);
+const format = (number, min = 0, max = min) => Number.isFinite(number)
+  ? number.toLocaleString('ja-JP', {minimumFractionDigits: min, maximumFractionDigits: max}) : '';
+
+for (const {id, name} of instruments) $('symbol').add(new Option(name, id));
+
+try {
+  const saved = JSON.parse(localStorage.getItem(storageKey));
+  if (saved) {
+    for (const id of fields) {
+      const input = $(id);
+      const stored = saved.fields?.[id];
+      if (typeof stored === 'string' && (input.tagName !== 'SELECT' || [...input.options].some(option => option.value === stored))) input.value = stored;
+    }
+    if (Array.isArray(saved.selected)) selected = amounts.filter(amount => saved.selected.includes(amount));
+    if (Array.isArray(saved.extras)) extras = [...new Set(saved.extras.map(positive).filter(amount => amount !== null && !amounts.includes(amount)))];
+    for (const {id} of instruments) {
+      if (typeof saved.overrides?.[id] === 'string') overrides[id] = saved.overrides[id];
+      if (typeof saved.manualPrices?.[id] === 'string') manualPrices[id] = saved.manualPrices[id];
+    }
+    $('auto').checked = saved.auto === true;
+  }
+} catch {}
+
+function save() {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify({
+      fields: Object.fromEntries(fields.map(id => [id, $(id).value])),
+      selected, extras, overrides, manualPrices, auto: $('auto').checked,
+    }));
+  } catch {}
+}
+
+function setResult(id, text) {
+  $(id).textContent = text;
+}
+
+function message(id, text) {
+  setResult(id, text);
+  $(id).hidden = !text;
+}
+
+function makeCell(row, text, header = false) {
+  const cell = document.createElement(header ? 'th' : 'td');
+  if (header) cell.scope = 'row';
+  cell.textContent = text;
+  row.append(cell);
+  return cell;
+}
+
+function toast(text) {
+  message('toast', text);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => message('toast', ''), 2400);
+}
+
+async function copyPrice(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const field = document.createElement('textarea');
+    field.value = text;
+    field.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+    const focused = document.activeElement;
+    document.body.append(field);
+    field.select();
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch {}
+    field.remove();
+    focused?.focus({preventScroll: true});
+    if (!copied) {
+      toast('コピーできませんでした');
+      return;
+    }
+  }
+  toast(text + ' をコピーしました');
+}
+
+function render() {
+  const {priceDecimals, lotStep, minLot} = instrument();
+  const currency = $('currency').value;
+  const isJPY = currency === 'JPY';
+  const rate = isJPY ? value('rate') : 1;
+  const price = value('price');
+  const lot = value('lot');
+  const size = value('size');
+  const rawBalance = $('balance').value;
+  const balance = rawBalance !== '' && Number.isFinite(Number(rawBalance)) && Number(rawBalance) >= 0
+    ? Number(rawBalance) : null;
+  const side = $('side').value;
+  const leverage = $('leverage').value === 'custom' ? value('customLev') : value('leverage');
+  const threshold = value('threshold');
+  const quotePrice = number => format(number, priceDecimals);
+  const money = number => format(number, isJPY ? 0 : 2, isJPY ? 2 : 4);
+  const withCurrency = number => Number.isFinite(number) ? money(number) + ' ' + currency : '';
+  const hasPosition = price !== null && lot !== null && size !== null;
+
+  for (const label of document.querySelectorAll('[data-currency]')) label.textContent = currency;
+  $('rateField').hidden = !isJPY;
+  $('customLevField').hidden = $('leverage').value !== 'custom';
+  const required = hasPosition && leverage && rate ? margin(price, lot, size, leverage) * rate : null;
+  setResult('required', withCurrency(required));
+  setResult('free', withCurrency(required !== null && balance !== null ? balance - required : null));
+
+  let cut = '';
+  if (required !== null && balance !== null && threshold) {
+    const result = liquidation(price, balance / rate, lot, size, leverage, threshold / 100, side);
+    if (balance <= required * threshold / 100) cut = quotePrice(price) + '（到達済み）';
+    else if (result > 0 && Number.isFinite(result)) cut = quotePrice(result);
+    else if (Number.isFinite(result)) cut = '正の価格範囲に到達点なし';
+  }
+  setResult('cut', cut);
+
+  $('stops').replaceChildren();
+  const losses = [...selected, ...extras].sort((a, b) => a - b).map(amount => [money(amount), amount]);
+  for (const percent of [1, 2, 3, 5]) {
+    const amount = balance === null ? null : balance * percent / 100;
+    const label = '残高 ' + percent + '%' + (amount === null ? '' : ' · ' + money(amount));
+    losses.push([label, amount]);
+  }
+  for (const [label, amount] of losses) {
+    const row = $('stops').insertRow();
+    makeCell(row, label, true);
+    const priceCell = makeCell(row, '');
+    const stop = hasPosition && rate && amount !== null ? stopPrice(price, amount / rate, lot, size, side) : null;
+    const valid = Number.isFinite(stop) && stop > 0 && Number(stop.toFixed(priceDecimals)) > 0;
+    if (valid) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = quotePrice(stop);
+      button.setAttribute('aria-label', label + ' の損切り価格 ' + button.textContent + ' をコピー');
+      priceCell.append(button);
+      row.dataset.copy = stop.toFixed(priceDecimals);
+    } else if (Number.isFinite(stop)) {
+      priceCell.textContent = '設定不可';
+    }
+    const difference = Number.isFinite(stop) ? Math.abs(stop - price) : null;
+    makeCell(row, quotePrice(difference));
+    makeCell(row, difference !== null ? format(difference / price * 100, 2) + '%' : '');
+  }
+
+  const fromStop = $('distanceType').value === 'stop';
+  $('distanceField').hidden = fromStop;
+  $('stopField').hidden = !fromStop;
+  const enteredStop = value('stopInput');
+  const width = fromStop ? (price && enteredStop ? (side === 'buy' ? price - enteredStop : enteredStop - price) : null) : value('distance');
+  const budget = value('budget');
+  const ideal = rate && size && budget && width > 0 ? theoreticalLot(budget / rate, width, size) : null;
+  const usable = Number.isFinite(ideal) ? practicalLot(ideal, minLot, lotStep) : null;
+  setResult('lotSpec', '最小ロット ' + minLot + ' ／ ロット刻み ' + lotStep);
+  message('lotStatus', fromStop && width !== null && width <= 0
+    ? (side === 'buy' ? '買いの損切り価格は現在価格より低くしてください。' : '売りの損切り価格は現在価格より高くしてください。')
+    : usable === 0 ? '許容損失額の範囲では最小ロットに届きません。' : '');
+  setResult('ideal', format(ideal, 0, 8));
+  setResult('usable', format(usable, 2, 8));
+  setResult('actual', usable > 0 ? withCurrency(lossAmount(width, usable, size) * rate) : '');
+  setResult('reverseMargin', usable > 0 && price && leverage ? withCurrency(margin(price, usable, size, leverage) * rate) : '');
+  $('nearby').replaceChildren();
+  if (Number.isFinite(usable)) {
+    for (const offset of [-3, -2, -1, 1, 2, 3]) {
+      const candidate = Number((usable + offset * 0.01).toPrecision(15));
+      if (candidate < minLot || practicalLot(candidate, minLot, lotStep) !== candidate) continue;
+      const row = $('nearby').insertRow();
+      makeCell(row, format(candidate, 2, 8), true);
+      makeCell(row, money(lossAmount(width, candidate, size) * rate));
+    }
+  }
+}
+
+function renderAmounts() {
+  $('presets').replaceChildren();
+  for (const amount of amounts) {
+    const label = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selected.includes(amount);
+    checkbox.addEventListener('change', () => {
+      selected = checkbox.checked ? [...selected, amount] : selected.filter(item => item !== amount);
+      save();
+      render();
+    });
+    label.append(checkbox, format(amount));
+    $('presets').append(label);
+  }
+  $('extras').replaceChildren();
+  for (const amount of extras) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.style.width = 'auto';
+    button.textContent = format(amount, 0, 8) + ' ×';
+    button.setAttribute('aria-label', format(amount, 0, 8) + ' を削除');
+    button.addEventListener('click', () => {
+      extras = extras.filter(item => item !== amount);
+      renderAmounts();
+      save();
+      render();
+      $('addLoss').focus();
+    });
+    $('extras').append(button);
+  }
+}
+
+function renderQuote() {
+  const manual = hasManual();
+  $('manualBadge').hidden = !manual;
+  $('resume').hidden = !manual;
+  const displayed = manual ? manualPrices[instrument().id] : quote?.price ?? '';
+  if ($('price').value !== String(displayed)) $('price').value = displayed;
+  setResult('source', quote?.source ?? '—');
+  setResult('fetched', quote ? quote.time.toLocaleString('ja-JP') : '—');
+  render();
+}
+
+async function updatePrice({focusOnError = true} = {}) {
+  const request = ++generation;
+  const id = instrument().id;
+  message('priceStatus', '価格を取得中…');
+  for (const provider of providers.filter(item => item.instrument === id && item.url && item.parse)) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      const response = await fetch(provider.url, {signal: controller.signal, cache: 'no-store', credentials: 'omit'});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const price = positive(provider.parse(await response.json()));
+      if (price === null) throw new Error('有効な価格フィールドが見つかりません');
+      if (request !== generation) return;
+      quote = {price, source: provider.name, time: new Date()};
+      message('priceStatus', '');
+      renderQuote();
+      return;
+    } catch (error) {
+      console.warn('[価格取得] ' + id + ' / ' + provider.name, controller.signal.aborted ? 'タイムアウト（5秒）' : error);
+      if (request !== generation) return;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  if (request !== generation) return;
+  quote = null;
+  renderQuote();
+  message('priceStatus', '価格を取得できませんでした。現在価格を手入力してください。');
+  if (focusOnError || !hasManual()) $('price').focus({preventScroll: true});
+}
+
+function restartTimer() {
+  clearInterval(interval);
+  if ($('auto').checked) interval = setInterval(() => updatePrice(), 30000);
+}
+
+function applyInstrument() {
+  $('size').value = overrides[instrument().id] ?? instrument().contractSize;
+  quote = null;
+  renderQuote();
+  updatePrice();
+}
+
+for (const id of fields.filter(id => id !== 'symbol')) {
+  $(id).addEventListener('input', () => { save(); render(); });
+}
+$('symbol').addEventListener('change', () => { save(); applyInstrument(); });
+$('size').addEventListener('input', () => {
+  overrides[instrument().id] = $('size').value;
+  save();
+  render();
+});
+$('price').addEventListener('input', () => {
+  manualPrices[instrument().id] = $('price').value;
+  $('manualBadge').hidden = false;
+  $('resume').hidden = false;
+  save();
+  render();
+});
+$('resume').addEventListener('click', () => {
+  delete manualPrices[instrument().id];
+  save();
+  renderQuote();
+  updatePrice();
+});
+$('refresh').addEventListener('click', () => updatePrice());
+$('auto').addEventListener('change', () => { save(); restartTimer(); });
+$('stops').addEventListener('click', event => {
+  const row = event.target.closest('tr[data-copy]');
+  if (row) copyPrice(row.dataset.copy);
+});
+$('addLoss').addEventListener('click', () => {
+  const amount = value('customLoss');
+  if (amount === null) {
+    $('customLoss').focus();
+    return;
+  }
+  if (amounts.includes(amount)) {
+    if (!selected.includes(amount)) selected.push(amount);
+  } else if (!extras.includes(amount)) extras.push(amount);
+  $('customLoss').value = '';
+  save();
+  renderAmounts();
+  render();
+});
+$('customLoss').addEventListener('keydown', event => {
+  if (event.key === 'Enter') $('addLoss').click();
+});
+
+const footer = document.querySelector('footer');
+function reserveFooterSpace() {
+  const height = footer.offsetHeight + 'px';
+  document.documentElement.style.setProperty('--footer', height);
+  document.body.style.paddingBottom = height;
+}
+reserveFooterSpace();
+if ('ResizeObserver' in window) new ResizeObserver(reserveFooterSpace).observe(footer);
+else window.addEventListener('resize', reserveFooterSpace);
+
+renderAmounts();
+applyInstrument();
+restartTimer();
+</script>
+</body>
+</html>
